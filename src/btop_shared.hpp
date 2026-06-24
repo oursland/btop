@@ -146,13 +146,16 @@ namespace Gpu {
 				 pcie_txrx = true,
 				 pcie_link = true,
 				 encoder_utilization = true,
-				 decoder_utilization = true;
+				 decoder_utilization = true,
+				 gt_utilization = false;
 	};
 
 	//* Per-device container for GPU info
 	struct gpu_info {
 		std::unordered_map<string, deque<long long>> gpu_percent = {
 			{"gpu-totals", {}},
+			{"gpu-rc-totals", {}},
+			{"gpu-mc-totals", {}},
 			{"gpu-vram-totals", {}},
 			{"gpu-pwr-totals", {}},
 		};
