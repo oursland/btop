@@ -163,6 +163,10 @@ target_link_libraries(libbtop Threads::Threads)
 # Enable GPU support
 if(LINUX AND BTOP_GPU)
   target_compile_definitions(libbtop PUBLIC GPU_SUPPORT)
+  #? The vendored i915 collector is x86-only; NVIDIA (NVML) is available on ARM as well.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    target_compile_definitions(libbtop PUBLIC INTEL_GPU_SUPPORT)
+  endif()
 
   if(BTOP_RSMI_STATIC)
     # ROCm doesn't properly add it's folders to the module path if `CMAKE_MODULE_PATH` is already
@@ -202,12 +206,14 @@ if(APPLE)
   target_link_libraries(libbtop
       $<LINK_LIBRARY:FRAMEWORK,CoreFoundation> $<LINK_LIBRARY:FRAMEWORK,IOKit>
   )
-  if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND BTOP_GPU)
+  if(BTOP_GPU)
     target_compile_definitions(libbtop PUBLIC GPU_SUPPORT)
 
-    find_library(IOREPORT_LIB IOReport)
-    if(IOREPORT_LIB)
-      target_link_libraries(libbtop ${IOREPORT_LIB})
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR "arm64" IN_LIST CMAKE_OSX_ARCHITECTURES)
+      find_library(IOREPORT_LIB IOReport)
+      if(IOREPORT_LIB)
+        target_link_libraries(libbtop ${IOREPORT_LIB})
+      endif()
     endif()
   endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "MidnightBSD")

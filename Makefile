@@ -99,16 +99,6 @@ ifeq ($(PLATFORM_LC)$(ARCH),linuxx86_64)
 		INTEL_GPU_SUPPORT := true
 	endif
 endif
-#? NVIDIA ARM SoC platforms (Jetson, GB10/DGX Spark) have working NVML builds
-ifeq ($(PLATFORM_LC)$(ARCH),linuxaarch64)
-	ifneq ($(STATIC),true)
-		GPU_SUPPORT := true
-		INTEL_GPU_SUPPORT := true
-	endif
-endif
-ifeq ($(PLATFORM_LC)$(ARCH),macosarm64)
-	GPU_SUPPORT := true
-endif
 #? NVIDIA (NVML) GPU support also works on Linux ARM (e.g. Jetson, Grace, GB10 DGX Spark).
 #? Intel GPU support stays x86_64-only.
 ifeq ($(PLATFORM_LC)$(ARCH),linuxaarch64)
@@ -120,6 +110,10 @@ ifeq ($(PLATFORM_LC)$(ARCH),linuxarm64)
 	ifneq ($(STATIC),true)
 		GPU_SUPPORT := true
 	endif
+endif
+#? macOS: Apple Silicon uses IOReport, Intel Macs use IOAccelerator.
+ifeq ($(PLATFORM_LC),macos)
+	GPU_SUPPORT := true
 endif
 ifneq ($(GPU_SUPPORT),true)
 	GPU_SUPPORT := false
