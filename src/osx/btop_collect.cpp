@@ -492,6 +492,7 @@ namespace Gpu {
 					.mem_total = true,
 					.mem_used = true,
 					.pcie_txrx = false,
+					.pcie_link = false,
 					.encoder_utilization = false,
 					.decoder_utilization = false
 				};
