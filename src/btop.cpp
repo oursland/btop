@@ -614,8 +614,6 @@ namespace Runner {
 						}
 
 						if (Global::debug) debug_timer("cpu", draw_done);
-
-
 						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
@@ -634,8 +632,6 @@ namespace Runner {
 								output += Gpu::draw(gpus_ref[gpu_panels[i]], i, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("gpu", draw_done);
-
-
 						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
@@ -657,8 +653,6 @@ namespace Runner {
 						if (not pause_output) output += Mem::draw(mem, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("mem", draw_done);
-
-
 						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
@@ -680,8 +674,6 @@ namespace Runner {
 						if (not pause_output) output += Net::draw(net, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("net", draw_done);
-
-
 						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
@@ -703,8 +695,6 @@ namespace Runner {
 						if (not pause_output) output += Proc::draw(proc, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("proc", draw_done);
-
-
 						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
