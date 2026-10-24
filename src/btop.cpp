@@ -361,29 +361,59 @@ namespace Runner {
 	//* Set while the runner thread writes to the terminal, which blocks for as long as the terminal is not reading (e.g. paused by the OS)
 	atomic<bool> writing (false);
 
+	//* Incremented by the runner at coarse progress points. The watchdog uses it to renew its
+	//* deadline while the runner is slow but still making progress (e.g. under sustained load).
+	std::atomic<uint64_t> progress (0);
+	static inline void bump_progress() noexcept { progress.fetch_add(1, std::memory_order_relaxed); }
+
 	static inline auto set_active(bool value) noexcept {
 		active.store(value);
 	}
 
-	//* Waits up to <wait_ms> for the runner thread to finish, not counting time blocked on terminal output or time this process was suspended
+	//* Waits up to <wait_ms> for the runner thread to finish, not counting time blocked on
+	//* terminal output, time this process was suspended, or time in which the runner advanced.
 	static void wait_idle(uint64_t wait_ms) {
-		uint64_t stalled_ms = 0;
-		auto last = time_ms();
-		while (active and stalled_ms < wait_ms) {
+		uint64_t stalled_us = 0;
+		auto last = Tools::uptime_micros();
+		auto last_progress = progress.load(std::memory_order_relaxed);
+		while (active and stalled_us < wait_ms * 1'000ULL) {
 			atomic_wait_for(active, true, 100);
-			const auto now = time_ms();
-			if (not writing or Global::quitting or Global::should_quit) {
-				stalled_ms += min(now - last, (uint64_t)1'000);
+			const auto now = Tools::uptime_micros();
+			const auto current_progress = progress.load(std::memory_order_relaxed);
+			if (current_progress != last_progress) {
+				//? The runner is still doing work; renew the deadline instead of calling it stalled.
+				last_progress = current_progress;
+				stalled_us = 0;
+			}
+			else if (not writing or Global::quitting or Global::should_quit) {
+				stalled_us += min(now - last, (uint64_t)1'000'000);
 			}
 			last = now;
 		}
 	}
 
-	//* Setup semaphore for triggering thread to do work
-	// TODO: This can be made a local without too much effort.
-	std::binary_semaphore do_work { 0 };
-	inline void thread_wait() { do_work.acquire(); }
-	inline void thread_trigger() { do_work.release(); }
+	//* Coalescing wake-up for the runner thread: repeated triggers while it is busy collapse into
+	//* one pending work item, so the main loop never has to wait for a slow collection.
+	std::mutex work_mtx;
+	std::condition_variable work_cv;
+	bool work_pending = false;
+	inline void thread_wait() {
+		std::unique_lock lock{work_mtx};
+		work_cv.wait(lock, [] { return work_pending; });
+		work_pending = false;
+	}
+	inline void thread_trigger() {
+		{
+			std::lock_guard lock{work_mtx};
+			work_pending = true;
+		}
+		work_cv.notify_one();
+	}
+
+	//* Protects the configuration snapshot handed from the main thread to the runner.
+	std::mutex conf_mtx;
+	//* Serializes writes to the terminal (the runner's frame and the main thread's clock/overlay).
+	std::mutex output_mtx;
 
 	//* Wrapper for raising privileges when using SUID bit
 	class gain_priv {
@@ -484,6 +514,7 @@ namespace Runner {
 		//* ----------------------------------------------- THREAD LOOP -----------------------------------------------
 		while (not Global::quitting) {
 			thread_wait();
+			bump_progress();
 			atomic_wait_for(active, true, 30'000);
 			if (active) {
 				Global::exit_error_msg = "Runner thread failed to get active lock (30s)!";
@@ -502,7 +533,13 @@ namespace Runner {
 			//? Set effective user if SUID bit is set
 			gain_priv powers{};
 
-			auto& conf = current_conf;
+			//? Work from a stable snapshot; the main thread may request another update while
+			//? this one is still collecting, and that update is picked up on the next iteration.
+			runner_conf conf;
+			{
+				std::lock_guard conf_lock{conf_mtx};
+				conf = current_conf;
+			}
 
 			//! DEBUG stats
 			if (Global::debug) {
@@ -577,6 +614,9 @@ namespace Runner {
 						}
 
 						if (Global::debug) debug_timer("cpu", draw_done);
+
+
+						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
 						throw std::runtime_error("Cpu:: -> " + string{e.what()});
@@ -594,6 +634,9 @@ namespace Runner {
 								output += Gpu::draw(gpus_ref[gpu_panels[i]], i, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("gpu", draw_done);
+
+
+						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
                         throw std::runtime_error("Gpu:: -> " + string{e.what()});
@@ -614,6 +657,9 @@ namespace Runner {
 						if (not pause_output) output += Mem::draw(mem, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("mem", draw_done);
+
+
+						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
 						throw std::runtime_error("Mem:: -> " + string{e.what()});
@@ -634,6 +680,9 @@ namespace Runner {
 						if (not pause_output) output += Net::draw(net, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("net", draw_done);
+
+
+						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
 						throw std::runtime_error("Net:: -> " + string{e.what()});
@@ -654,6 +703,9 @@ namespace Runner {
 						if (not pause_output) output += Proc::draw(proc, conf.force_redraw, conf.no_update);
 
 						if (Global::debug) debug_timer("proc", draw_done);
+
+
+						Runner::bump_progress();
 					}
 					catch (const std::exception& e) {
 						throw std::runtime_error("Proc:: -> " + string{e.what()});
@@ -735,12 +787,17 @@ namespace Runner {
 
 			//? If overlay isn't empty, print output without color and then print overlay on top
 			const bool term_sync = Config::getB("terminal_sync");
+			bump_progress();
 			writing = true;
-			cout << (term_sync ? Term::sync_start : "") << (conf.overlay.empty()
-					? output
-					: (output.empty() ? "" : Fx::ub + Theme::c("inactive_fg") + Fx::uncolor(output)) + conf.overlay)
-				<< (term_sync ? Term::sync_end : "") << flush;
+			{
+				std::lock_guard output_lock{output_mtx};
+				cout << (term_sync ? Term::sync_start : "") << (conf.overlay.empty()
+						? output
+						: (output.empty() ? "" : Fx::ub + Theme::c("inactive_fg") + Fx::uncolor(output)) + conf.overlay)
+					<< (term_sync ? Term::sync_end : "") << flush;
+			}
 			writing = false;
+			bump_progress();
 		}
 		//* ----------------------------------------------- THREAD LOOP -----------------------------------------------
 		return {};
@@ -749,30 +806,31 @@ namespace Runner {
 
 	//* Runs collect and draw in a secondary thread, unlocks and locks config to update cached values
 	void run(const string& box, bool no_update, bool force_redraw) {
-		wait_idle(10'000);
-		if (active) {
-			Logger::warning("Runner thread slow (>10s), waiting up to 30s...");
-			wait_idle(20'000);
-		}
-		if (active) {
-			Global::exit_error_msg = "Runner thread stalled for 30s, exiting.";
-			clean_quit(1);
-		}
 		if (stopping or Global::resized) return;
 
 		if (box == "overlay") {
+			//? Don't wait for a slow collector (or a paused terminal) just to refresh the clock/overlay.
+			std::unique_lock output_lock{output_mtx, std::try_to_lock};
+			if (not output_lock.owns_lock()) return;
 			const bool term_sync = Config::getB("terminal_sync");
 			cout << (term_sync ? Term::sync_start : "") << Global::overlay << (term_sync ? Term::sync_end : "") << flush;
 		}
 		else if (box == "clock") {
+			std::unique_lock output_lock{output_mtx, std::try_to_lock};
+			if (not output_lock.owns_lock()) return;
 			const bool term_sync = Config::getB("terminal_sync");
 			cout << (term_sync ? Term::sync_start : "") << Global::clock << (term_sync ? Term::sync_end : "") << flush;
 		}
 		else {
+			//? Config::unlock() must wait for the runner to be idle (it reads Proc state), and
+			//? queueing another update behind a slow collection only makes the backlog worse.
+			//? Skip this tick instead; the next one picks up the latest configuration.
+			if (active) return;
+
 			Config::unlock();
 			Config::lock();
 
-			current_conf = {
+			runner_conf next_conf = {
 				(box == "all" ? Config::current_boxes : vector{box}),
 				no_update, force_redraw,
 				(not Config::getB("tty_mode") and Config::getB("background_update")),
@@ -780,13 +838,16 @@ namespace Runner {
 				Global::clock
 			};
 
-			if (Menu::active and not current_conf.background_update) Global::overlay.clear();
+			if (Menu::active and not next_conf.background_update) Global::overlay.clear();
 
+			{
+				std::lock_guard conf_lock{conf_mtx};
+				current_conf = std::move(next_conf);
+			}
+			//? Coalesces with any update the runner is still working on instead of blocking the
+			//? main loop until it finishes.
 			thread_trigger();
-			atomic_wait_for(active, false, 10);
 		}
-
-
 	}
 
 	//* Stops any work being done in runner thread and checks for thread errors
