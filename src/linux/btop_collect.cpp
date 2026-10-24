@@ -365,10 +365,21 @@ namespace Gpu {
 			double smoothed_util = 0.0;
 		};
 
+		enum XeClass : size_t {
+			XE_CLASS_RCS, XE_CLASS_CCS, XE_CLASS_BCS,
+			XE_CLASS_OTHER, XE_CLASS_VCS, XE_CLASS_VECS,
+			XE_CLASS_COUNT
+		};
+		constexpr array<string_view, XE_CLASS_COUNT> xe_class_names = {"rcs", "ccs", "bcs", "other", "vcs", "vecs"};
+
 		struct XeState {
 			string pci_slot;  // e.g., "0000:00:02.0"
 			string freq_sysfs_path;
 			string power_path;  // hwmon power node (µW); empty when no power sensor (e.g. iGPUs)
+			string energy_path; // hwmon energy1_input (µJ); used to derive average power when no power1_* exists
+			uint64_t prev_energy_uj = 0;
+			uint64_t prev_energy_ns = 0;
+			bool energy_valid = false;
 			int pmu_type = -1;
 			int drm_fd = -1;
 			int group_fd = -1;
@@ -378,15 +389,12 @@ namespace Gpu {
 			uint64_t mem_total = 0;
 			uint64_t prev_time_ns = 0;
 			bool first_sample = true;
-			// fdinfo cycle tracking
-			uint64_t prev_main_cycles = 0;
-			uint64_t prev_media_cycles = 0;
-			uint64_t prev_main_total_cycles = 0;
-			uint64_t prev_media_total_cycles = 0;
-			double smoothed_main_util = 0.0;
-			double smoothed_media_util = 0.0;
-			bool prev_main_valid = false;
-			bool prev_media_valid = false;
+			// fdinfo cycle tracking, per engine class
+			array<uint64_t, XE_CLASS_COUNT> prev_cycles{};
+			array<uint64_t, XE_CLASS_COUNT> prev_total{};
+			array<double, XE_CLASS_COUNT> smoothed_util{};
+			array<bool, XE_CLASS_COUNT> prev_valid{};
+			std::unordered_map<uint64_t, array<uint64_t, XE_CLASS_COUNT>> prev_client_cycles;
 			// fdinfo_probe_enabled: should we keep polling /proc/*/fdinfo?
 			// fdinfo_split_available: have we actually received split main/media
 			// data yet? This is what gates the RC/MC UI, independent of whether
@@ -398,7 +406,7 @@ namespace Gpu {
 
 		bool init(int gpu_index, const string& card_path, const string& pmu_device);
 		bool shutdown(int gpu_index);
-		template <bool is_init> bool collect(int gpu_index, gpu_info* gpus_slice);
+		template <bool is_init> bool collect(int gpu_index, int panel_index, gpu_info* gpus_slice);
 
 		vector<XeState> states;
 		vector<bool> initialized_states;
@@ -503,7 +511,11 @@ namespace Shared {
 			count = gpus.size();
 			gpu_b_height_offsets.resize(gpus.size());
 			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
-				gpu_b_height_offsets[i] = Gpu::Intel::gpu_panel_height_offset(gpus[i]);
+				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
+					+ gpus[i].supported_functions.pwr_usage
+					+ (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
+					+ (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
+						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
 		}
 	#endif
 
@@ -2283,44 +2295,22 @@ namespace Gpu {
 			return not engines.empty();
 		}
 
-			struct FdinfoEngineCycles {
-				uint64_t rcs = 0;
-				uint64_t ccs = 0;
-				uint64_t bcs = 0;
-				uint64_t other = 0;
-				uint64_t vcs = 0;
-				uint64_t vecs = 0;
-				uint64_t total_rcs = 0;
-				uint64_t total_ccs = 0;
-				uint64_t total_bcs = 0;
-				uint64_t total_other = 0;
-				uint64_t total_vcs = 0;
-				uint64_t total_vecs = 0;
-
-				[[nodiscard]] bool has_main() const {
-					return rcs > 0 or ccs > 0 or bcs > 0 or other > 0
-						or total_rcs > 0 or total_ccs > 0 or total_bcs > 0 or total_other > 0;
-				}
-
-				[[nodiscard]] bool has_media() const {
-					return vcs > 0 or vecs > 0 or total_vcs > 0 or total_vecs > 0;
-				}
-
-				[[nodiscard]] uint64_t main_cycles() const {
-					return rcs + ccs + bcs + other;
-				}
-
-				[[nodiscard]] uint64_t media_cycles() const {
-					return vcs + vecs;
-				}
+			//? Per-client counters, indexed by xe engine class.
+			struct FdinfoClientCycles {
+				array<uint64_t, XE_CLASS_COUNT> cycles{};
+				array<uint64_t, XE_CLASS_COUNT> total{};
+				array<uint64_t, XE_CLASS_COUNT> capacity{};
+				array<bool, XE_CLASS_COUNT> present{};
 			};
 
-			// Struct to hold fdinfo cycle counts
+			//? Aggregated counters. Cycles are additive across clients; the total timestamp
+			//? and engine capacity are shared hardware values, so take the maximum.
 			struct FdinfoCycles {
-				uint64_t main_cycles = 0;      // rcs + ccs + bcs + other
-				uint64_t media_cycles = 0;     // vcs + vecs
-				uint64_t main_total_cycles = 0;
-				uint64_t media_total_cycles = 0;
+				array<uint64_t, XE_CLASS_COUNT> cycles{};
+				array<uint64_t, XE_CLASS_COUNT> total{};
+				array<uint64_t, XE_CLASS_COUNT> capacity{};
+				array<bool, XE_CLASS_COUNT> present{};
+				std::unordered_map<uint64_t, array<uint64_t, XE_CLASS_COUNT>> client_cycles;
 				bool has_main = false;
 				bool has_media = false;
 			};
@@ -2330,7 +2320,7 @@ namespace Gpu {
 		// the max timestamp for each group instead of summing identical totals.
 		static FdinfoCycles collect_fdinfo_cycles(const string& pci_slot) {
 			FdinfoCycles result;
-			std::unordered_map<uint64_t, FdinfoEngineCycles> clients;
+			std::unordered_map<uint64_t, FdinfoClientCycles> clients;
 
 			try {
 				for (const auto& proc_entry : fs::directory_iterator("/proc")) {
@@ -2375,7 +2365,7 @@ namespace Gpu {
 							bool matches_slot = false;
 							uint64_t client_id = 0;
 							bool has_client_id = false;
-							FdinfoEngineCycles fd_cycles;
+							FdinfoClientCycles fd_cycles;
 
 							while (getline(file, line)) {
 								if (line.rfind("drm-driver:", 0) == 0) {
@@ -2397,121 +2387,53 @@ namespace Gpu {
 									} catch (...) {}
 								}
 								else if (is_xe and matches_slot) {
-									if (line.rfind("drm-cycles-rcs:", 0) == 0) {
+									auto parse_into = [&](const string& prefix, uint64_t& out) -> bool {
+										if (line.rfind(prefix, 0) != 0) return false;
 										try {
-											fd_cycles.rcs = static_cast<uint64_t>(stoull(line.substr(15)));
+											out = static_cast<uint64_t>(stoull(line.substr(prefix.size())));
 										} catch (...) {}
-									}
-									else if (line.rfind("drm-cycles-ccs:", 0) == 0) {
-										try {
-											fd_cycles.ccs = static_cast<uint64_t>(stoull(line.substr(15)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-cycles-bcs:", 0) == 0) {
-										try {
-											fd_cycles.bcs = static_cast<uint64_t>(stoull(line.substr(15)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-cycles-other:", 0) == 0) {
-										try {
-											fd_cycles.other = static_cast<uint64_t>(stoull(line.substr(17)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-cycles-vcs:", 0) == 0) {
-										try {
-											fd_cycles.vcs = static_cast<uint64_t>(stoull(line.substr(15)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-cycles-vecs:", 0) == 0) {
-										try {
-											fd_cycles.vecs = static_cast<uint64_t>(stoull(line.substr(16)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-total-cycles-rcs:", 0) == 0) {
-										try {
-											fd_cycles.total_rcs = static_cast<uint64_t>(stoull(line.substr(21)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-total-cycles-ccs:", 0) == 0) {
-										try {
-											fd_cycles.total_ccs = static_cast<uint64_t>(stoull(line.substr(21)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-total-cycles-bcs:", 0) == 0) {
-										try {
-											fd_cycles.total_bcs = static_cast<uint64_t>(stoull(line.substr(21)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-total-cycles-other:", 0) == 0) {
-										try {
-											fd_cycles.total_other = static_cast<uint64_t>(stoull(line.substr(23)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-total-cycles-vcs:", 0) == 0) {
-										try {
-											fd_cycles.total_vcs = static_cast<uint64_t>(stoull(line.substr(21)));
-										} catch (...) {}
-									}
-									else if (line.rfind("drm-total-cycles-vecs:", 0) == 0) {
-										try {
-											fd_cycles.total_vecs = static_cast<uint64_t>(stoull(line.substr(22)));
-										} catch (...) {}
+										return true;
+									};
+									for (size_t c = 0; c < XE_CLASS_COUNT; ++c) {
+										const string cls = string(xe_class_names[c]);
+										bool matched = parse_into("drm-cycles-" + cls + ":", fd_cycles.cycles[c]);
+										matched = parse_into("drm-total-cycles-" + cls + ":", fd_cycles.total[c]) or matched;
+										matched = parse_into("drm-engine-capacity-" + cls + ":", fd_cycles.capacity[c]) or matched;
+										if (matched) fd_cycles.present[c] = true;
 									}
 								}
 							}
 
 							if (not is_xe or not matches_slot or not has_client_id) continue;
-							if (not fd_cycles.has_main() and not fd_cycles.has_media()) continue;
-
 							auto& merged = clients[client_id];
-							if (fd_cycles.has_main()) {
-								merged.rcs = max(merged.rcs, fd_cycles.rcs);
-								merged.ccs = max(merged.ccs, fd_cycles.ccs);
-								merged.bcs = max(merged.bcs, fd_cycles.bcs);
-								merged.other = max(merged.other, fd_cycles.other);
-								merged.total_rcs = max(merged.total_rcs, fd_cycles.total_rcs);
-								merged.total_ccs = max(merged.total_ccs, fd_cycles.total_ccs);
-								merged.total_bcs = max(merged.total_bcs, fd_cycles.total_bcs);
-								merged.total_other = max(merged.total_other, fd_cycles.total_other);
+							bool any = false;
+							for (size_t c = 0; c < XE_CLASS_COUNT; ++c) {
+								if (not fd_cycles.present[c]) continue;
+								merged.cycles[c] = max(merged.cycles[c], fd_cycles.cycles[c]);
+								merged.total[c] = max(merged.total[c], fd_cycles.total[c]);
+								merged.capacity[c] = max(merged.capacity[c], fd_cycles.capacity[c]);
+								merged.present[c] = true;
+								any = true;
 							}
-							if (fd_cycles.has_media()) {
-								merged.vcs = max(merged.vcs, fd_cycles.vcs);
-								merged.vecs = max(merged.vecs, fd_cycles.vecs);
-								merged.total_vcs = max(merged.total_vcs, fd_cycles.total_vcs);
-								merged.total_vecs = max(merged.total_vecs, fd_cycles.total_vecs);
-							}
+							if (not any) clients.erase(client_id);
 						}
 					} catch (...) {}
 				}
 			} catch (...) {}
 
-			uint64_t max_total_rcs = 0;
-			uint64_t max_total_ccs = 0;
-			uint64_t max_total_bcs = 0;
-			uint64_t max_total_other = 0;
-			uint64_t max_total_vcs = 0;
-			uint64_t max_total_vecs = 0;
-
 			for (const auto& [client_id, merged] : clients) {
-				(void)client_id;
-				if (merged.has_main()) {
-					result.main_cycles += merged.main_cycles();
-					max_total_rcs = max(max_total_rcs, merged.total_rcs);
-					max_total_ccs = max(max_total_ccs, merged.total_ccs);
-					max_total_bcs = max(max_total_bcs, merged.total_bcs);
-					max_total_other = max(max_total_other, merged.total_other);
-					result.has_main = true;
-				}
-				if (merged.has_media()) {
-					result.media_cycles += merged.media_cycles();
-					max_total_vcs = max(max_total_vcs, merged.total_vcs);
-					max_total_vecs = max(max_total_vecs, merged.total_vecs);
-					result.has_media = true;
+				for (size_t c = 0; c < XE_CLASS_COUNT; ++c) {
+					if (not merged.present[c]) continue;
+					result.cycles[c] += merged.cycles[c];
+					result.total[c] = max(result.total[c], merged.total[c]);
+					result.capacity[c] = max(result.capacity[c], merged.capacity[c]);
+					result.present[c] = true;
+					result.client_cycles[client_id][c] = merged.cycles[c];
 				}
 			}
-
-			result.main_total_cycles = max(max(max_total_rcs, max_total_ccs), max(max_total_bcs, max_total_other));
-			result.media_total_cycles = max(max_total_vcs, max_total_vecs);
+			result.has_main = result.present[XE_CLASS_RCS] or result.present[XE_CLASS_CCS]
+				or result.present[XE_CLASS_BCS] or result.present[XE_CLASS_OTHER];
+			result.has_media = result.present[XE_CLASS_VCS] or result.present[XE_CLASS_VECS];
 
 			return result;
 		}
@@ -2686,60 +2608,61 @@ namespace Gpu {
 				FdinfoCycles test_cycles = collect_fdinfo_cycles(st.pci_slot);
 				st.fdinfo_probe_enabled = true;
 				st.fdinfo_next_probe_ns = 0;
-				if (test_cycles.has_main and test_cycles.main_total_cycles > 0) {
-					st.prev_main_cycles = test_cycles.main_cycles;
-					st.prev_main_total_cycles = test_cycles.main_total_cycles;
-					st.prev_main_valid = true;
+				bool any_valid = false;
+				for (size_t c = 0; c < XE_CLASS_COUNT; ++c) {
+					if (not test_cycles.present[c] or test_cycles.total[c] == 0) continue;
+					st.prev_cycles[c] = test_cycles.cycles[c];
+					st.prev_total[c] = test_cycles.total[c];
+					st.prev_valid[c] = true;
+					any_valid = true;
 				}
-				if (test_cycles.has_media and test_cycles.media_total_cycles > 0) {
-					st.prev_media_cycles = test_cycles.media_cycles;
-					st.prev_media_total_cycles = test_cycles.media_total_cycles;
-					st.prev_media_valid = true;
-				}
-				st.fdinfo_split_available = st.prev_main_valid or st.prev_media_valid;
-				if (st.prev_main_valid or st.prev_media_valid) {
+				st.prev_client_cycles = test_cycles.client_cycles;
+				st.fdinfo_split_available = any_valid;
+				if (any_valid) {
 					Logger::debug("Xe: Using fdinfo for GPU utilization (PCI: {})", st.pci_slot);
 				} else {
 					Logger::debug("Xe: fdinfo probing enabled, falling back to gtidle until counters are available");
 				}
 			}
 
-			// PMU fallback when gtidle sysfs is unavailable
+			// PMU fallback when gtidle sysfs is unavailable (older kernels / SR-IOV VFs).
+			// Failure to obtain utilization counters must not hide the GPU: VRAM, clock and
+			// fdinfo may still work, so the panel is kept with gpu_utilization disabled.
 			if (st.gt_idle.empty()) {
-				if (st.pmu_type < 0) {
-					Logger::debug("Xe: Failed to get PMU type for {}", pmu_dev);
-					close(st.drm_fd);
-					st.drm_fd = -1;
-					return false;
+				uint64_t active_event = 0;
+				uint64_t total_event = 0;
+				if (st.pmu_type >= 0) {
+					active_event = read_event_config(pmu_dev, "engine-active-ticks");
+					total_event = read_event_config(pmu_dev, "engine-total-ticks");
 				}
 
-				uint64_t active_event = read_event_config(pmu_dev, "engine-active-ticks");
-				uint64_t total_event = read_event_config(pmu_dev, "engine-total-ticks");
+				if (st.pmu_type < 0 or active_event == 0 or total_event == 0 or st.engines.empty()) {
+					Logger::warning("Xe: No gtidle or PMU counters for {}; utilization unavailable", pmu_dev);
+				} else {
+					for (auto& eng : st.engines) {
+						// Pack event ID, engine class/instance/gt into perf config field
+						uint64_t active_cfg = build_config(active_event, eng.gt_id, eng.engine_class, eng.engine_instance);
+						uint64_t total_cfg = build_config(total_event, eng.gt_id, eng.engine_class, eng.engine_instance);
 
-				if (active_event == 0 or total_event == 0) {
-					Logger::debug("Xe: Required PMU events not found");
-					close(st.drm_fd);
-					st.drm_fd = -1;
-					return false;
-				}
-
-				for (auto& eng : st.engines) {
-					// Pack event ID, engine class/instance/gt into perf config field
-					uint64_t active_cfg = build_config(active_event, eng.gt_id, eng.engine_class, eng.engine_instance);
-					uint64_t total_cfg = build_config(total_event, eng.gt_id, eng.engine_class, eng.engine_instance);
-
-					if (st.group_fd == -1) {
-						eng.active_fd = open_perf_counter(st.pmu_type, active_cfg, -1);
-						if (eng.active_fd >= 0) {
+						if (st.group_fd == -1) {
+							eng.active_fd = open_perf_counter(st.pmu_type, active_cfg, -1);
+							if (eng.active_fd < 0) {
+								Logger::warning("Xe: Failed to open the PMU group leader; utilization unavailable");
+								break;
+							}
 							st.group_fd = eng.active_fd;
+						} else {
+							eng.active_fd = open_perf_counter(st.pmu_type, active_cfg, st.group_fd);
 						}
-					} else {
-						eng.active_fd = open_perf_counter(st.pmu_type, active_cfg, st.group_fd);
-					}
-					eng.total_fd = open_perf_counter(st.pmu_type, total_cfg, st.group_fd);
+						eng.total_fd = open_perf_counter(st.pmu_type, total_cfg, st.group_fd);
+						if (eng.active_fd < 0 or eng.total_fd < 0)
+							Logger::warning("Xe: Failed to open a PMU counter; utilization may be partial");
 
-					if (eng.active_fd >= 0) st.member_fds.push_back(eng.active_fd);
-					if (eng.total_fd >= 0) st.member_fds.push_back(eng.total_fd);
+						if (eng.active_fd >= 0) st.member_fds.push_back(eng.active_fd);
+						if (eng.total_fd >= 0) st.member_fds.push_back(eng.total_fd);
+					}
+					if (st.group_fd < 0)
+						Logger::warning("Xe: PMU group unavailable; utilization disabled");
 				}
 			}
 
@@ -2756,17 +2679,20 @@ namespace Gpu {
 				}
 			}
 
-			// GPU power via hwmon. Discrete Arc cards expose power1_average/_input
-			// (microwatts) here; integrated GPUs usually expose nothing, so power is
-			// simply reported as unsupported in that case. No DRM fd / perms needed.
+			// GPU power via hwmon. i915 and xe both expose power1_max/rated_max but no
+			// power1_input/average; xe does expose energy1_input (µJ), which we integrate
+			// over time. No DRM fd / perms needed.
 			fs::path hwmon_dir = fs::path(card_path) / "device" / "hwmon";
 			if (fs::exists(hwmon_dir)) {
 				for (const auto& h : fs::directory_iterator(hwmon_dir)) {
-					// Prefer power1_average (filtered) over power1_input (instantaneous).
+					// Prefer an instantaneous/filtered power channel when the driver has one.
 					fs::path avg = h.path() / "power1_average";
 					fs::path inst = h.path() / "power1_input";
-					if (fs::exists(avg)) { st.power_path = avg.string(); break; }
-					if (fs::exists(inst)) { st.power_path = inst.string(); break; }
+					if (fs::exists(avg)) st.power_path = avg.string();
+					else if (fs::exists(inst)) st.power_path = inst.string();
+					fs::path energy = h.path() / "energy1_input";
+					if (fs::exists(energy)) st.energy_path = energy.string();
+					if (not st.power_path.empty() or not st.energy_path.empty()) break;
 				}
 			}
 
@@ -2812,14 +2738,16 @@ namespace Gpu {
 			st.mem_total = 0;
 			st.freq_sysfs_path.clear();
 			st.first_sample = true;
-			st.prev_main_cycles = 0;
-			st.prev_media_cycles = 0;
-			st.prev_main_total_cycles = 0;
-			st.prev_media_total_cycles = 0;
-			st.smoothed_main_util = 0.0;
-			st.smoothed_media_util = 0.0;
-			st.prev_main_valid = false;
-			st.prev_media_valid = false;
+			st.prev_cycles.fill(0);
+			st.prev_total.fill(0);
+			st.smoothed_util.fill(0.0);
+			st.prev_valid.fill(false);
+			st.prev_client_cycles.clear();
+			st.prev_energy_uj = 0;
+			st.prev_energy_ns = 0;
+			st.power_path.clear();
+			st.energy_path.clear();
+			st.pmu_type = -1;
 			st.fdinfo_probe_enabled = false;
 			st.fdinfo_split_available = false;
 			st.fdinfo_next_probe_ns = 0;
@@ -2827,7 +2755,7 @@ namespace Gpu {
 			return true;
 		}
 
-		template <bool is_init> bool collect(int gpu_index, gpu_info* gpus_slice) {
+		template <bool is_init> bool collect(int gpu_index, int panel_index, gpu_info* gpus_slice) {
 			if (gpu_index < 0 or static_cast<size_t>(gpu_index) >= initialized_states.size()) return false;
 			if (not initialized_states[gpu_index]) return false;
 
@@ -2846,11 +2774,11 @@ namespace Gpu {
 				}
 				bool split_gt = st.fdinfo_split_available or (has_main_gt and has_media_gt);
 				gpus_slice->supported_functions = {
-					.gpu_utilization = (st.fdinfo_probe_enabled or not st.gt_idle.empty() or not st.engines.empty()),
+					.gpu_utilization = (st.fdinfo_probe_enabled or not st.gt_idle.empty() or st.group_fd >= 0),
 					.mem_utilization = false,
 					.gpu_clock = not st.freq_sysfs_path.empty(),
 					.mem_clock = false,
-					.pwr_usage = not st.power_path.empty(),
+					.pwr_usage = (not st.power_path.empty() or not st.energy_path.empty()),
 					.pwr_state = false,
 					.temp_info = false,
 					.mem_total = has_mem_info,
@@ -2924,8 +2852,8 @@ namespace Gpu {
 				gpus_slice->supported_functions.encoder_utilization = true;
 				gpus_slice->supported_functions.decoder_utilization = true;
 				gpus_slice->supported_functions.gt_utilization = true;
-				if (static_cast<size_t>(gpu_index) < gpu_b_height_offsets.size())
-					gpu_b_height_offsets[gpu_index] = Intel::gpu_panel_height_offset(*gpus_slice);
+				if (static_cast<size_t>(panel_index) < gpu_b_height_offsets.size())
+					gpu_b_height_offsets[panel_index] = Intel::gpu_panel_height_offset(*gpus_slice);
 				auto& totals = gpus_slice->gpu_percent.at("gpu-totals");
 				auto& rc = gpus_slice->gpu_percent.at("gpu-rc-totals");
 				auto& mc = gpus_slice->gpu_percent.at("gpu-mc-totals");
@@ -2950,64 +2878,68 @@ namespace Gpu {
 					st.fdinfo_next_probe_ns = now_ns + FDINFO_RETRY_NS;
 				}
 
-				if (current.has_main and current.main_total_cycles > 0) {
-					if (not st.prev_main_valid
-						or current.main_total_cycles <= st.prev_main_total_cycles
-						or current.main_cycles < st.prev_main_cycles) {
-						st.prev_main_cycles = current.main_cycles;
-						st.prev_main_total_cycles = current.main_total_cycles;
-						st.prev_main_valid = true;
-						st.smoothed_main_util = 0.0;
-					} else {
-						uint64_t delta_cycles = current.main_cycles - st.prev_main_cycles;
-						uint64_t delta_total = current.main_total_cycles - st.prev_main_total_cycles;
-						double raw_main_util = 100.0 * (double)delta_cycles / (double)delta_total;
-						if (raw_main_util > 100.0) raw_main_util = 100.0;
-						st.smoothed_main_util = EMA_ALPHA * raw_main_util + (1.0 - EMA_ALPHA) * st.smoothed_main_util;
-						used_fdinfo = true;
-						st.prev_main_cycles = current.main_cycles;
-						st.prev_main_total_cycles = current.main_total_cycles;
+				//? Per-client deltas: a client that appeared after the previous tick only
+				//? establishes a baseline, and a client that disappeared contributes nothing.
+				//? This keeps one process exiting from zeroing the utilization of all others.
+				array<uint64_t, XE_CLASS_COUNT> delta_cycles{};
+				for (const auto& [client_id, cycles] : current.client_cycles) {
+					auto prev_it = st.prev_client_cycles.find(client_id);
+					if (prev_it == st.prev_client_cycles.end()) continue;
+					for (size_t c = 0; c < XE_CLASS_COUNT; ++c) {
+						if (cycles[c] >= prev_it->second[c])
+							delta_cycles[c] += cycles[c] - prev_it->second[c];
 					}
-				} else {
-					st.smoothed_main_util = 0.0;
-					st.prev_main_valid = false;
 				}
-				if (current.has_media and current.media_total_cycles > 0) {
-					if (not st.prev_media_valid
-						or current.media_total_cycles <= st.prev_media_total_cycles
-						or current.media_cycles < st.prev_media_cycles) {
-						st.prev_media_cycles = current.media_cycles;
-						st.prev_media_total_cycles = current.media_total_cycles;
-						st.prev_media_valid = true;
-						st.smoothed_media_util = 0.0;
-					} else {
-						uint64_t delta_cycles = current.media_cycles - st.prev_media_cycles;
-						uint64_t delta_total = current.media_total_cycles - st.prev_media_total_cycles;
-						double raw_media_util = 100.0 * (double)delta_cycles / (double)delta_total;
-						if (raw_media_util > 100.0) raw_media_util = 100.0;
-						st.smoothed_media_util = EMA_ALPHA * raw_media_util + (1.0 - EMA_ALPHA) * st.smoothed_media_util;
-						used_fdinfo = true;
-						st.prev_media_cycles = current.media_cycles;
-						st.prev_media_total_cycles = current.media_total_cycles;
+
+				for (size_t c = 0; c < XE_CLASS_COUNT; ++c) {
+					if (not current.present[c]) {
+						st.prev_valid[c] = false;
+						st.prev_total[c] = 0;
+						st.smoothed_util[c] = 0.0;
+						continue;
 					}
-				} else {
-					st.smoothed_media_util = 0.0;
-					st.prev_media_valid = false;
+					const uint64_t total = current.total[c];
+					const uint64_t prev_total = st.prev_total[c];
+					if (not st.prev_valid[c] or total <= prev_total) {
+						//? First sample for this class or a counter reset: resync without
+						//? clobbering the value that is already on screen.
+						st.prev_total[c] = total;
+						st.prev_valid[c] = true;
+						continue;
+					}
+					const uint64_t delta_total = total - prev_total;
+					const uint64_t capacity = current.capacity[c] > 0 ? current.capacity[c] : 1;
+					double raw_util = 100.0 * static_cast<double>(delta_cycles[c])
+						/ (static_cast<double>(delta_total) * static_cast<double>(capacity));
+					raw_util = clamp(raw_util, 0.0, 100.0);
+					st.smoothed_util[c] = EMA_ALPHA * raw_util + (1.0 - EMA_ALPHA) * st.smoothed_util[c];
+					st.prev_total[c] = total;
+					st.prev_valid[c] = true;
+					used_fdinfo = true;
 				}
-				st.fdinfo_split_available = st.prev_main_valid or st.prev_media_valid;
+
+				st.prev_client_cycles.clear();
+				for (const auto& [client_id, cycles] : current.client_cycles)
+					st.prev_client_cycles[client_id] = cycles;
+
+				st.fdinfo_split_available = current.has_main or current.has_media;
 				if (used_fdinfo) {
 					enable_split_ui();
-					main_util = current.has_main ? st.smoothed_main_util : 0.0;
-					media_util = current.has_media ? st.smoothed_media_util : 0.0;
-					max_util = std::max(main_util, media_util);
+					main_util = std::max(st.smoothed_util[XE_CLASS_RCS], st.smoothed_util[XE_CLASS_CCS]);
+					media_util = std::max(st.smoothed_util[XE_CLASS_VCS], st.smoothed_util[XE_CLASS_VECS]);
+					max_util = 0.0;
+					for (size_t c = 0; c < XE_CLASS_COUNT; ++c)
+						max_util = std::max(max_util, st.smoothed_util[c]);
 					push_gt_utilization();
 				}
-			} else if (st.fdinfo_split_available and (st.prev_main_valid or st.prev_media_valid)) {
+			} else if (st.fdinfo_split_available) {
 				used_fdinfo = true;
 				enable_split_ui();
-				main_util = st.prev_main_valid ? st.smoothed_main_util : 0.0;
-				media_util = st.prev_media_valid ? st.smoothed_media_util : 0.0;
-				max_util = std::max(main_util, media_util);
+				main_util = std::max(st.smoothed_util[XE_CLASS_RCS], st.smoothed_util[XE_CLASS_CCS]);
+				media_util = std::max(st.smoothed_util[XE_CLASS_VCS], st.smoothed_util[XE_CLASS_VECS]);
+				max_util = 0.0;
+				for (size_t c = 0; c < XE_CLASS_COUNT; ++c)
+					max_util = std::max(max_util, st.smoothed_util[c]);
 				push_gt_utilization();
 			}
 			if (not used_fdinfo and not st.gt_idle.empty()) {
@@ -3108,15 +3040,35 @@ namespace Gpu {
 			}
 
 			long long pwr_pct = 0;
+			long long pwr_mw = -1;
 			if (not st.power_path.empty()) {
 				ifstream power_file(st.power_path);
 				unsigned long long power_uw = 0;
-				if (power_file and power_file >> power_uw) {
-					gpus_slice->pwr_usage = static_cast<long long>(power_uw / 1000ULL); //? µW → mW
-					gpus_slice->pwr_max_usage = std::max(gpus_slice->pwr_max_usage, gpus_slice->pwr_usage);
-					if (gpus_slice->pwr_max_usage > 0) {
-						pwr_pct = clamp((long long)round((double)gpus_slice->pwr_usage * 100.0 / (double)gpus_slice->pwr_max_usage), 0ll, 100ll);
+				if (power_file and power_file >> power_uw)
+					pwr_mw = static_cast<long long>(power_uw / 1000ULL); //? µW → mW
+			}
+			else if (not st.energy_path.empty()) {
+				ifstream energy_file(st.energy_path);
+				unsigned long long energy_uj = 0;
+				if (energy_file and energy_file >> energy_uj) {
+					if (not st.energy_valid or energy_uj < st.prev_energy_uj or now_ns <= st.prev_energy_ns) {
+						st.prev_energy_uj = energy_uj;
+						st.prev_energy_ns = now_ns;
+						st.energy_valid = true;
+					} else {
+						const double delta_s = static_cast<double>(now_ns - st.prev_energy_ns) / 1e9;
+						if (delta_s > 0.0)
+							pwr_mw = static_cast<long long>(llround((static_cast<double>(energy_uj - st.prev_energy_uj) / delta_s) / 1000.0));
+						st.prev_energy_uj = energy_uj;
+						st.prev_energy_ns = now_ns;
 					}
+				}
+			}
+			if (pwr_mw >= 0) {
+				gpus_slice->pwr_usage = pwr_mw;
+				gpus_slice->pwr_max_usage = std::max(gpus_slice->pwr_max_usage, gpus_slice->pwr_usage);
+				if (gpus_slice->pwr_max_usage > 0) {
+					pwr_pct = clamp((long long)round((double)gpus_slice->pwr_usage * 100.0 / (double)gpus_slice->pwr_max_usage), 0ll, 100ll);
 				}
 			}
 			gpus_slice->gpu_percent.at("gpu-pwr-totals").push_back(pwr_pct);
@@ -3342,7 +3294,7 @@ namespace Gpu {
 			for (size_t i = 0; i < gpu_instances.size(); ++i) {
 				gpu_info* slice = gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + i;
 				if (gpu_instances[i].driver_name == "xe") {
-					Xe::collect<1>(gpu_instances[i].xe_state_index, slice);
+					Xe::collect<1>(gpu_instances[i].xe_state_index, static_cast<int>(Nvml::device_count + Rsmi::device_count + Asysfs::device_count + i), slice);
 				} else if (gpu_instances[i].driver_name == "i915" and gpu_instances[i].i915_engines) {
 					slice->supported_functions = {
 						.gpu_utilization = true,
@@ -3392,7 +3344,7 @@ namespace Gpu {
 				gpu_info* slice = gpus_slice + i;
 
 				if (inst.driver_name == "xe" and inst.xe_state_index >= 0) {
-					Xe::collect<is_init>(inst.xe_state_index, slice);
+					Xe::collect<is_init>(inst.xe_state_index, static_cast<int>(Nvml::device_count + Rsmi::device_count + Asysfs::device_count + i), slice);
 				} else if (inst.driver_name == "i915" and inst.i915_engines) {
 					if constexpr(is_init) {
 						slice->supported_functions = {
