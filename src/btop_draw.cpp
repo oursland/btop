@@ -1146,7 +1146,7 @@ namespace Gpu {
 		//? PCIe link generation and width
 		if (gpu.supported_functions.pcie_link and link_x_vec[index] > 0) {
 			out += Mv::to(b_y, link_x_vec[index]) + Theme::c("div_line") + Symbols::h_line;
-			if (gpu.pcie_link_gen > 0) {
+			if (gpu.pcie_link_gen > 0 and gpu.pcie_link_width > 0) {
 				const string link = fmt::format("PCIe {}.0 x{}", gpu.pcie_link_gen, gpu.pcie_link_width);
 				out += Symbols::title_left + Fx::b + Theme::c("title") + link + Fx::ub + Theme::c("div_line") + Symbols::title_right
 					+ Symbols::h_line * max(0, 12 - (int)link.size());

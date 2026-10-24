@@ -152,12 +152,14 @@ namespace Gpu {
 
 	//* Per-device container for GPU info
 	struct gpu_info {
+		//? Seed every series with one zero so draw can always call back() before the
+		//? first backend sample (backend-agnostic version of the Apple Silicon fix).
 		std::unordered_map<string, deque<long long>> gpu_percent = {
-			{"gpu-totals", {}},
-			{"gpu-rc-totals", {}},
-			{"gpu-mc-totals", {}},
-			{"gpu-vram-totals", {}},
-			{"gpu-pwr-totals", {}},
+			{"gpu-totals", {0}},
+			{"gpu-rc-totals", {0}},
+			{"gpu-mc-totals", {0}},
+			{"gpu-vram-totals", {0}},
+			{"gpu-pwr-totals", {0}},
 		};
 		unsigned int gpu_clock_speed; // MHz
 
