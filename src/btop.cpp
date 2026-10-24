@@ -574,8 +574,12 @@ namespace Runner {
 					if (box.starts_with("gpu"))
 						gpu_panels.push_back(box.back()-'0');
 
+				//? The per-process panel lives in the memory box, so it needs GPU
+				//? collection even when no GPU box or inline GPU info is shown.
+				const bool gpu_proc_shown = Gpu::proc_available and Config::getS("show_gpu_proc") != "Off";
+
 				vector<Gpu::gpu_info> gpus;
-				if (gpu_in_cpu_panel or not gpu_panels.empty()) {
+				if (gpu_in_cpu_panel or not gpu_panels.empty() or gpu_proc_shown) {
 					if (Global::debug) debug_timer("gpu", collect_begin);
 					gpus = Gpu::collect(conf.no_update);
 					if (Global::debug) debug_timer("gpu", collect_done);

@@ -900,7 +900,12 @@ namespace Cpu {
 		int max_row = b_height - 3; // Subtracting one extra row for the load average (and power if enabled)
 		int n_gpus_to_show = 0;
 	#ifdef GPU_SUPPORT
-		n_gpus_to_show = show_gpu ? (gpus.size() - (gpu_always ? 0 : Gpu::shown)) : 0;
+		if (show_gpu) {
+			for (size_t i = 0; i < gpus.size(); ++i) {
+				if (gpu_auto and v_contains(Gpu::shown_panels, static_cast<int>(i))) continue;
+				n_gpus_to_show += 1 + (gpus[i].supported_functions.utilization_breakdown ? 1 : 0);
+			}
+		}
 	#endif
 		max_row -= n_gpus_to_show;
 
@@ -1013,6 +1018,13 @@ namespace Cpu {
 				if (gpus[i].supported_functions.pwr_usage) {
 					out += ' ' + Theme::g("cached").at(clamp(safeVal(gpus[i].gpu_percent, "gpu-pwr-totals"s).back(), 0ll, 100ll))
 						+ fmt::format("{:>4.{}f}", gpus[i].pwr_usage / 1000.0, gpus[i].pwr_usage < 10'000 ? 2 : gpus[i].pwr_usage < 100'000 ? 1 : 0) + Theme::c("main_fg") + 'W';
+				}
+
+				if (gpus[i].supported_functions.utilization_breakdown) {
+					string breakdown = fmt::format("  REN {}%  TIL {}%", gpus[i].renderer_utilization, gpus[i].tiler_utilization);
+					if (gpus[i].supported_functions.ane_info)
+						breakdown += fmt::format("  ANE {:.{}f}W", gpus[i].ane_power_mw / 1000.0, gpus[i].ane_power_mw < 10'000 ? 2 : 1);
+					out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("inactive_fg") + uresize(breakdown, max(1, b_width - 2));
 				}
 
 				if (cy > b_height - 1) break;
@@ -1134,6 +1146,21 @@ namespace Gpu {
 				out += rjust(to_string(temp), 4) + Theme::c("main_fg") + unit;
 			}
 			out += Theme::c("div_line") + Symbols::v_line;
+			rows_used++;
+		}
+
+		//? Apple Silicon Renderer/Tiler breakdown and ANE power
+		if (gpu.supported_functions.utilization_breakdown) {
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg") + Fx::b
+				+ "REN " + Theme::g("cpu").at(clamp(gpu.renderer_utilization, 0ll, 100ll))
+				+ rjust(to_string(gpu.renderer_utilization), 3) + Theme::c("main_fg") + '%'
+				+ Theme::c("div_line") + Symbols::v_line + Theme::c("main_fg") + Fx::b + "TIL "
+				+ Theme::g("cpu").at(clamp(gpu.tiler_utilization, 0ll, 100ll))
+				+ rjust(to_string(gpu.tiler_utilization), 3) + Theme::c("main_fg") + '%';
+			if (gpu.supported_functions.ane_info) {
+				out += Theme::c("div_line") + Symbols::v_line + Theme::c("main_fg") + Fx::b + "ANE "
+					+ fmt::format("{:>5.{}f}", gpu.ane_power_mw / 1000.0, gpu.ane_power_mw < 10'000 ? 2 : 1) + 'W';
+			}
 			rows_used++;
 		}
 
@@ -1267,6 +1294,22 @@ namespace Mem {
 		auto totalMem = Mem::get_totalMem();
 		string out;
 		out.reserve(height * width);
+
+		//? Reserve the bottom of the disks column for the per-process GPU panel.
+		int gpu_proc_rows = 0;
+#ifdef GPU_SUPPORT
+		const bool gpu_proc_enabled = show_disks and Config::getS("show_gpu_proc") != "Off"
+			and Gpu::proc_available and not Gpu::proc_devices.empty() and disks_width >= 26;
+		if (gpu_proc_enabled) {
+			const int needed = 2 + static_cast<int>(Gpu::proc_info.size())
+				+ 2 * static_cast<int>(Gpu::proc_devices.size());
+			const int max_rows = max(0, (height - 2) / 2);
+			if (max_rows >= 4) {
+				gpu_proc_rows = min(needed, max_rows);
+				if (height - 2 - gpu_proc_rows < 4) gpu_proc_rows = 0;
+			}
+		}
+#endif
 
 		//* Redraw elements not needed to be updated every cycle
 		if (redraw) {
@@ -1411,6 +1454,7 @@ namespace Mem {
 		//? Disks
 		if (show_disks) {
 			const auto& disks = mem.disks;
+			const int disk_limit = height - 2 - gpu_proc_rows;
 			cx = mem_width; cy = 0;
 			bool big_disk = disks_width >= 25;
 			divider = Mv::l(1) + Theme::c("div_line") + Symbols::div_left + Symbols::h_line * disks_width + Theme::c("mem_box") + Fx::ub + Symbols::div_right + Mv::l(disks_width);
@@ -1418,7 +1462,7 @@ namespace Mem {
 			if (io_mode) {
 				for (const auto& mount : mem.disks_order) {
 					if (not disks.contains(mount)) continue;
-					if (cy > height - 3) break;
+					if (cy > disk_limit - 1) break;
 					const auto disk = safeVal(disks, mount);
 					if (disk.io_read.empty()) continue;
 					const string total = floating_humanizer(disk.total, not big_disk);
@@ -1432,7 +1476,7 @@ namespace Mem {
 					out += Mv::to(y+2+cy++, x+1+cx) + (big_disk ? " IO% " : " IO   " + Mv::l(2)) + Theme::c("inactive_fg") + graph_bg * (disks_width - 6)
 						+ Mv::l(disks_width - 6) + io_graphs.at(mount + "_activity")(disk.io_activity, redraw or data_same) + Theme::c("main_fg");
 					}
-					if (++cy > height - 3) break;
+					if (++cy > disk_limit - 1) break;
 					if (io_graph_combined) {
 						if (not io_graphs.contains(mount)) continue;
 						auto comb_val = disk.io_read.back() + disk.io_write.back();
@@ -1458,7 +1502,7 @@ namespace Mem {
 			else {
 				for (const auto& mount : mem.disks_order) {
 					if (not disks.contains(mount)) continue;
-					if (cy > height - 3) break;
+					if (cy > disk_limit - 1) break;
 					const auto disk = safeVal(disks, mount);
 					if (disk.name.empty() or not disk_meters_used.contains(mount)) continue;
 					auto comb_val = (not disk.io_read.empty() ? disk.io_read.back() + disk.io_write.back() : 0ll);
@@ -1472,17 +1516,17 @@ namespace Mem {
 						+ trans(human_total) + Fx::ub + Theme::c("main_fg");
 					if (big_disk and not human_io.empty())
 						out += Mv::to(y+1+cy, x+1+cx + round((double)disks_width / 2) - round((double)human_io.size() / 2) - 1) + hu_div + human_io + hu_div;
-					if (++cy > height - 3) break;
+					if (++cy > disk_limit - 1) break;
 					if (show_io_stat and io_graphs.contains(mount + "_activity")) {
 						out += Mv::to(y+1+cy, x+1+cx) + (big_disk ? " IO% " : " IO   " + Mv::l(2)) + Theme::c("inactive_fg") + graph_bg * (disks_width - 6) + Theme::g("available").at(clamp(disk.io_activity.back(), 50ll, 100ll))
 							+ Mv::l(disks_width - 6) + io_graphs.at(mount + "_activity")(disk.io_activity, redraw or data_same) + Theme::c("main_fg");
 						if (not big_disk) out += Mv::to(y+1+cy, x+cx+1) + Theme::c("main_fg") + human_io;
-						if (++cy > height - 3) break;
+						if (++cy > disk_limit - 1) break;
 					}
 
 					out += Mv::to(y+1+cy, x+1+cx) + (big_disk ? " Used:" + rjust(to_string(disk.used_percent) + '%', 4) : "U") + ' '
 						+ disk_meters_used.at(mount)(disk.used_percent) + rjust(human_used, (big_disk ? 9 : 5));
-					if (++cy > height - 3) break;
+					if (++cy > disk_limit - 1) break;
 
 					if (disk_meters_free.contains(mount) and cmp_less_equal(disks.size() * 3 + (show_io_stat ? disk_ios : 0), height - 1)) {
 						out += Mv::to(y+1+cy, x+1+cx) + (big_disk ? " Free:" + rjust(to_string(disk.free_percent) + '%', 4) : "F") + ' '
@@ -1493,7 +1537,63 @@ namespace Mem {
 
 				}
 			}
-			if (cy < height - 2) out += Mv::to(y+1+cy, x+1+cx) + divider;
+			if (cy < disk_limit) out += Mv::to(y+1+cy, x+1+cx) + divider;
+
+#ifdef GPU_SUPPORT
+			if (gpu_proc_rows > 0) {
+				int row = height - 2 - gpu_proc_rows;
+				//? Panel title separator
+				out += Mv::to(y+1+row, x+1+cx) + Theme::c("div_line") + Symbols::div_left + Symbols::h_line
+					+ Theme::c("title") + Fx::b + "GPU" + Fx::ub + Theme::c("div_line")
+					+ Symbols::h_line * max(0, disks_width - 4) + Symbols::div_right;
+				row++;
+
+				const bool show_user = disks_width >= 40;
+				const int name_w = max(4, disks_width - (show_user ? 29 : 20));
+				for (size_t d = 0; d < Gpu::proc_devices.size() and row <= height - 3; ++d) {
+					const auto& dev = Gpu::proc_devices[d];
+					string header = dev.name;
+					if (not dev.pci_bus_id.empty()) header += " @" + dev.pci_bus_id;
+					out += Mv::to(y+1+row, x+1+cx) + Theme::c("title") + Fx::b
+						+ uresize(header, max(1, disks_width - 2)) + Fx::ub;
+					if (++row > height - 3) break;
+
+					const string memline = "MEM " + floating_humanizer(dev.mem_used) + "/" + floating_humanizer(dev.mem_total)
+						+ "  UTIL " + to_string(dev.utilization) + "%";
+					out += Mv::to(y+1+row, x+1+cx) + Theme::c("main_fg")
+						+ uresize(memline, max(1, disks_width - 2));
+					if (++row > height - 3) break;
+
+					out += Mv::to(y+1+row, x+1+cx) + Theme::c("inactive_fg")
+						+ rjust("PID", 6) + ' ';
+					if (show_user) out += ljust("USER", 8) + ' ';
+					out += ljust("NAME", name_w) + ' ' + rjust("GPU%", 5) + ' ' + rjust("MEM", 6);
+					if (++row > height - 3) break;
+
+					bool any = false;
+					for (const auto& proc : Gpu::proc_info) {
+						if (proc.gpu_index != d) continue;
+						any = true;
+						if (row > height - 3) break;
+						const string user = uresize(proc.user, 8);
+						const string name = uresize(proc.name, name_w);
+						const string mem = floating_humanizer(proc.mem_used, true);
+						out += Mv::to(y+1+row, x+1+cx) + Theme::c("main_fg")
+							+ rjust(to_string(proc.pid), 6) + ' ';
+						if (show_user) out += Theme::c("inactive_fg") + ljust(user, 8) + ' ';
+						out += Theme::c("main_fg") + ljust(name, name_w) + ' '
+							+ Theme::g("cpu").at(clamp(proc.gpu_utilization, 0u, 100u))
+							+ rjust(to_string(proc.gpu_utilization) + '%', 5) + ' '
+							+ Theme::c("inactive_fg") + rjust(mem, 6);
+						row++;
+					}
+					if (not any and row <= height - 3) {
+						out += Mv::to(y+1+row, x+1+cx) + Theme::c("inactive_fg") + "No GPU processes";
+						row++;
+					}
+				}
+			}
+#endif
 		}
 
 		redraw = false;
@@ -2324,11 +2424,15 @@ namespace Draw {
 		if (Cpu::shown) {
 			using namespace Cpu;
 		#ifdef GPU_SUPPORT
-			// inline GPU information
-			int gpus_extra_height =
-				Config::getS("show_gpu_info") == "On" ? Gpu::count
-				: Config::getS("show_gpu_info") == "Auto" ? Gpu::count - Gpu::shown
-				: 0;
+			// inline GPU information: one row per GPU plus an optional breakdown row
+			int gpus_extra_height = 0;
+			const auto gpu_info_mode = Config::getS("show_gpu_info");
+			if (gpu_info_mode != "Off") {
+				for (size_t i = 0; i < Gpu::gpus.size(); ++i) {
+					if (gpu_info_mode == "Auto" and v_contains(Gpu::shown_panels, static_cast<int>(i))) continue;
+					gpus_extra_height += 1 + (Gpu::gpus[i].supported_functions.utilization_breakdown ? 1 : 0);
+				}
+			}
 		#endif
             const bool show_temp = (Config::getB("check_temp") and got_sensors);
 			width = round((double)Term::width * width_p / 100);

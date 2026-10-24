@@ -164,6 +164,7 @@ namespace Config {
 								"#* Select from a list of detected attributes from the options menu."},
 	#ifdef GPU_SUPPORT
 		{"show_gpu_info",		"#* If gpu info should be shown in the cpu box. Available values = \"Auto\", \"On\" and \"Off\"."},
+		{"show_gpu_proc",		"#* Show per-process GPU statistics under the disks panel (NVIDIA/NVML). Available values = \"Auto\", \"On\" and \"Off\"."},
 	#endif
 		{"cpu_invert_lower", 	"#* Toggles if the lower CPU graph should be inverted."},
 
@@ -316,6 +317,7 @@ namespace Config {
 		{"custom_gpu_name4", ""},
 		{"custom_gpu_name5", ""},
 		{"show_gpu_info", "Auto"},
+		{"show_gpu_proc", "Auto"},
 	#ifdef __APPLE__
 		{"gpu_utilization_mode", "active"},
 	#endif
@@ -631,6 +633,8 @@ namespace Config {
 	#ifdef GPU_SUPPORT
 		else if (name == "show_gpu_info" and not v_contains(show_gpu_values, value))
 			validError = "Invalid value for show_gpu_info: " + value;
+		else if (name == "show_gpu_proc" and not v_contains(show_gpu_values, value))
+			validError = "Invalid value for show_gpu_proc: " + value;
 		#ifdef __APPLE__
 		else if (name == "gpu_utilization_mode" and not v_contains(gpu_utilization_modes, value))
 			validError = "Invalid value for gpu_utilization_mode: " + value;

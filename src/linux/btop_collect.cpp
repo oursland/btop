@@ -194,6 +194,9 @@ namespace Gpu {
 		#define NVML_TEMPERATURE_GPU                 0
 		#define NVML_PCIE_UTIL_TX_BYTES              0
 		#define NVML_PCIE_UTIL_RX_BYTES              1
+		#define NVML_VALUE_NOT_AVAILABLE_ULL         (std::numeric_limits<unsigned long long>::max())
+		#define NVML_ERROR_NOT_FOUND                 6
+		#define NVML_ERROR_INSUFFICIENT_SIZE         7
 
 		typedef void* nvmlDevice_t; // we won't be accessing any of the underlying struct's properties, so this is fine
 		typedef int nvmlReturn_t, // enums are basically ints
@@ -205,6 +208,36 @@ namespace Gpu {
 
 		struct nvmlUtilization_t {unsigned int gpu, memory;};
 		struct nvmlMemory_t {unsigned long long total, free, used;};
+		struct nvmlPciInfo_t {
+			char busIdLegacy[16];
+			unsigned int domain, bus, device, pciDeviceId, pciSubSystemId;
+			char busId[32];
+		};
+		struct nvmlProcessInfo_v1_t {
+			unsigned int pid;
+			unsigned long long usedGpuMemory;
+		};
+		struct nvmlProcessInfo_v2_t {
+			unsigned int pid;
+			unsigned long long usedGpuMemory;
+			unsigned int gpuInstanceId;
+			unsigned int computeInstanceId;
+		};
+		struct nvmlProcessInfo_t {
+			unsigned int pid;
+			unsigned long long usedGpuMemory;
+			unsigned int gpuInstanceId;
+			unsigned int computeInstanceId;
+			unsigned long long usedGpuCcProtectedMemory;
+		};
+		struct nvmlProcessUtilizationSample_t {
+			unsigned int pid;
+			unsigned int smUtil;
+			unsigned int memUtil;
+			unsigned int encUtil;
+			unsigned int decUtil;
+			unsigned long long timeStamp;
+		};
 
 		//? Function pointers
 		const char* (*nvmlErrorString)(nvmlReturn_t);
@@ -226,16 +259,31 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetCurrPcieLinkGeneration)(nvmlDevice_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetCurrPcieLinkWidth)(nvmlDevice_t, unsigned int*);
+		nvmlReturn_t (*nvmlDeviceGetProcessUtilization)(nvmlDevice_t, nvmlProcessUtilizationSample_t*, unsigned int*, unsigned long long);
+		nvmlReturn_t (*nvmlDeviceGetGraphicsRunningProcesses_v1)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_v1_t*);
+		nvmlReturn_t (*nvmlDeviceGetGraphicsRunningProcesses_v2)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_v2_t*);
+		nvmlReturn_t (*nvmlDeviceGetGraphicsRunningProcesses_v3)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*);
+		nvmlReturn_t (*nvmlDeviceGetComputeRunningProcesses_v1)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_v1_t*);
+		nvmlReturn_t (*nvmlDeviceGetComputeRunningProcesses_v2)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_v2_t*);
+		nvmlReturn_t (*nvmlDeviceGetComputeRunningProcesses_v3)(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*);
+		nvmlReturn_t (*nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*);
+		nvmlReturn_t (*nvmlDeviceGetPciInfo)(nvmlDevice_t, nvmlPciInfo_t*);
 
 		//? Data
 		void* nvml_dl_handle;
 		bool initialized = false;
+		bool process_memory_functions_available = false;
+		bool process_utilization_function_available = false;
 		bool init();
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
+		bool collect_process_stats();
 		vector<nvmlDevice_t> devices;
 		unsigned int device_count = 0;
 		vector<bool> shared_mem; //? True for devices without dedicated VRAM (UMA platforms like GB10/DGX Spark)
+		vector<string> pci_bus_ids;
+		vector<unsigned long long> process_last_timestamps;
+		std::unordered_map<uint64_t, unsigned int> process_util_cache;
 	}
 
 	//? AMD data collection
@@ -513,6 +561,7 @@ namespace Shared {
 			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
 				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
 					+ gpus[i].supported_functions.pwr_usage
+					+ gpus[i].supported_functions.utilization_breakdown
 					+ (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
 					+ (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
 						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
@@ -1393,9 +1442,26 @@ namespace Gpu {
 		    LOAD_OPTIONAL(nvmlDeviceGetDecoderUtilization);
 		    LOAD_OPTIONAL(nvmlDeviceGetCurrPcieLinkGeneration);
 		    LOAD_OPTIONAL(nvmlDeviceGetCurrPcieLinkWidth);
+		    LOAD_OPTIONAL(nvmlDeviceGetProcessUtilization);
+		    LOAD_OPTIONAL(nvmlDeviceGetGraphicsRunningProcesses_v1);
+		    LOAD_OPTIONAL(nvmlDeviceGetGraphicsRunningProcesses_v2);
+		    LOAD_OPTIONAL(nvmlDeviceGetGraphicsRunningProcesses_v3);
+		    LOAD_OPTIONAL(nvmlDeviceGetComputeRunningProcesses_v1);
+		    LOAD_OPTIONAL(nvmlDeviceGetComputeRunningProcesses_v2);
+		    LOAD_OPTIONAL(nvmlDeviceGetComputeRunningProcesses_v3);
+		    LOAD_OPTIONAL(nvmlDeviceGetPciInfo_v3);
+		    LOAD_OPTIONAL(nvmlDeviceGetPciInfo);
 
             #undef LOAD_REQUIRED
             #undef LOAD_OPTIONAL
+				process_utilization_function_available = nvmlDeviceGetProcessUtilization != nullptr;
+				process_memory_functions_available =
+					nvmlDeviceGetGraphicsRunningProcesses_v3 != nullptr
+					or nvmlDeviceGetGraphicsRunningProcesses_v2 != nullptr
+					or nvmlDeviceGetGraphicsRunningProcesses_v1 != nullptr
+					or nvmlDeviceGetComputeRunningProcesses_v3 != nullptr
+					or nvmlDeviceGetComputeRunningProcesses_v2 != nullptr
+					or nvmlDeviceGetComputeRunningProcesses_v1 != nullptr;
 				return true;
 			};
 
@@ -1457,8 +1523,28 @@ namespace Gpu {
 				//? Check supported functions & get maximums
 				Nvml::collect<1>(gpus.data());
 
+				//? PCI location and per-process sampling state
+				pci_bus_ids.assign(device_count, "");
+				process_last_timestamps.assign(device_count, 0);
+				for (unsigned int i = 0; i < device_count; ++i) {
+					nvmlPciInfo_t pci{};
+					nvmlReturn_t pci_result = NVML_ERROR_NOT_SUPPORTED;
+					if (nvmlDeviceGetPciInfo_v3 != nullptr)
+						pci_result = nvmlDeviceGetPciInfo_v3(devices[i], &pci);
+					else if (nvmlDeviceGetPciInfo != nullptr)
+						pci_result = nvmlDeviceGetPciInfo(devices[i], &pci);
+					if (pci_result == NVML_SUCCESS)
+						pci_bus_ids[i] = (pci.busId[0] != '\0' ? string(pci.busId) : string(pci.busIdLegacy));
+				}
+				Gpu::proc_available = process_memory_functions_available or process_utilization_function_available;
+
 				return true;
-			} else {initialized = true; shutdown(); return false;}
+			} else {
+				Gpu::proc_available = false;
+				initialized = true;
+				shutdown();
+				return false;
+			}
 		}
 
 		bool shutdown() {
@@ -1782,6 +1868,145 @@ namespace Gpu {
 				}
     		}
 
+			return true;
+		}
+
+		static string proc_name(unsigned int pid) {
+			const fs::path proc = Shared::procPath / std::to_string(pid);
+			{
+				ifstream comm(proc / "comm");
+				string name;
+				if (comm and getline(comm, name) and not name.empty()) return name;
+			}
+			{
+				ifstream cmdline(proc / "cmdline");
+				string name;
+				if (cmdline and getline(cmdline, name, '\0') and not name.empty())
+					return fs::path(name).filename().string();
+			}
+			return "?";
+		}
+
+		static string proc_user(unsigned int pid) {
+			ifstream status(Shared::procPath / std::to_string(pid) / "status");
+			for (string line; getline(status, line);) {
+				if (line.rfind("Uid:", 0) != 0) continue;
+				const auto start = line.find_first_of("0123456789", 4);
+				if (start == string::npos) break;
+				const auto end = line.find_first_not_of("0123456789", start);
+				try {
+					const auto uid = static_cast<uid_t>(stoul(line.substr(start, end - start)));
+					static std::unordered_map<uid_t, string> cache;
+					if (auto it = cache.find(uid); it != cache.end()) return it->second;
+					string user = "?";
+					if (const auto* pw = getpwuid(uid); pw != nullptr) user = pw->pw_name;
+					cache.emplace(uid, user);
+					return user;
+				} catch (...) { break; }
+			}
+			return "?";
+		}
+
+		template <typename T, typename Fn>
+		static void append_process_memory(nvmlDevice_t device, Fn fn, std::unordered_map<unsigned int, unsigned long long>& mem_by_pid) {
+			if (fn == nullptr) return;
+			unsigned int count = 0;
+			auto result = fn(device, &count, nullptr);
+			if (result == NVML_ERROR_NOT_FOUND or result == NVML_ERROR_NOT_SUPPORTED) return;
+			if (result != NVML_SUCCESS and result != NVML_ERROR_INSUFFICIENT_SIZE) return;
+			if (count == 0) return;
+			vector<T> processes(count);
+			result = fn(device, &count, processes.data());
+			if (result != NVML_SUCCESS) return;
+			for (unsigned int i = 0; i < count; ++i) {
+				//? NVML uses an all-ones PID for samples not associated with a process.
+				if (processes[i].pid == 0 or processes[i].pid == 0xFFFFFFFFu) continue;
+				if (processes[i].usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ULL) continue;
+				auto& mem = mem_by_pid[processes[i].pid];
+				mem = max(mem, static_cast<unsigned long long>(processes[i].usedGpuMemory));
+			}
+		}
+
+		bool collect_process_stats() {
+			Gpu::proc_info.clear();
+			Gpu::proc_devices.clear();
+			if (not initialized or (not process_memory_functions_available and not process_utilization_function_available))
+				return false;
+
+			for (unsigned int i = 0; i < device_count and i < gpus.size(); ++i) {
+				std::unordered_map<unsigned int, unsigned long long> mem_by_pid;
+				std::unordered_map<unsigned int, unsigned int> util_by_pid;
+
+				if (process_memory_functions_available) {
+					append_process_memory<nvmlProcessInfo_t>(devices[i], nvmlDeviceGetGraphicsRunningProcesses_v3, mem_by_pid);
+					append_process_memory<nvmlProcessInfo_t>(devices[i], nvmlDeviceGetComputeRunningProcesses_v3, mem_by_pid);
+					append_process_memory<nvmlProcessInfo_v2_t>(devices[i], nvmlDeviceGetGraphicsRunningProcesses_v2, mem_by_pid);
+					append_process_memory<nvmlProcessInfo_v2_t>(devices[i], nvmlDeviceGetComputeRunningProcesses_v2, mem_by_pid);
+					append_process_memory<nvmlProcessInfo_v1_t>(devices[i], nvmlDeviceGetGraphicsRunningProcesses_v1, mem_by_pid);
+					append_process_memory<nvmlProcessInfo_v1_t>(devices[i], nvmlDeviceGetComputeRunningProcesses_v1, mem_by_pid);
+				}
+
+				bool got_samples = false;
+				if (process_utilization_function_available) {
+					unsigned int sample_count = 64;
+					vector<nvmlProcessUtilizationSample_t> samples(sample_count);
+					auto result = nvmlDeviceGetProcessUtilization(devices[i], samples.data(), &sample_count, process_last_timestamps[i]);
+					if (result == NVML_ERROR_INSUFFICIENT_SIZE and sample_count > 0) {
+						samples.resize(sample_count);
+						result = nvmlDeviceGetProcessUtilization(devices[i], samples.data(), &sample_count, process_last_timestamps[i]);
+					}
+					if (result == NVML_SUCCESS and sample_count > 0) {
+						got_samples = true;
+						for (unsigned int n = 0; n < sample_count; ++n) {
+							const auto& sample = samples[n];
+							process_last_timestamps[i] = max(process_last_timestamps[i], sample.timeStamp);
+							if (sample.pid == 0 or sample.pid == 0xFFFFFFFFu) continue;
+							auto& util = util_by_pid[sample.pid];
+							util = max(util, sample.smUtil);
+							const auto key = (static_cast<uint64_t>(i) << 32) | sample.pid;
+							auto& cached = process_util_cache[key];
+							cached = max(cached, sample.smUtil);
+						}
+					}
+				}
+
+				Gpu::gpu_proc_device dev;
+				dev.name = i < gpu_names.size() ? gpu_names[i] : "NVIDIA GPU";
+				dev.pci_bus_id = i < pci_bus_ids.size() ? pci_bus_ids[i] : "";
+				dev.mem_total = gpus[i].mem_total;
+				dev.mem_used = gpus[i].mem_used;
+				dev.utilization = static_cast<unsigned int>(gpus[i].gpu_percent.at("gpu-totals").back());
+				Gpu::proc_devices.push_back(dev);
+
+				std::unordered_set<unsigned int> pids;
+				for (const auto& [pid, ignored] : mem_by_pid) pids.insert(pid);
+				for (const auto& [pid, ignored] : util_by_pid) pids.insert(pid);
+				for (const auto pid : pids) {
+					Gpu::gpu_proc_info info;
+					info.gpu_index = i;
+					info.pid = pid;
+					if (util_by_pid.contains(pid))
+						info.gpu_utilization = util_by_pid.at(pid);
+					else if (not got_samples) {
+						//? NVML only reports process utilization when a new sample period elapsed;
+						//? reuse the last sample while memory-only processes are still listed.
+						const auto key = (static_cast<uint64_t>(i) << 32) | pid;
+						if (auto it = process_util_cache.find(key); it != process_util_cache.end())
+							info.gpu_utilization = it->second;
+					}
+					info.mem_used = mem_by_pid.contains(pid) ? mem_by_pid.at(pid) : 0;
+					info.name = proc_name(pid);
+					info.user = proc_user(pid);
+					Gpu::proc_info.push_back(std::move(info));
+				}
+			}
+
+			std::stable_sort(Gpu::proc_info.begin(), Gpu::proc_info.end(), [](const auto& a, const auto& b) {
+				if (a.gpu_index != b.gpu_index) return a.gpu_index < b.gpu_index;
+				if (a.gpu_utilization != b.gpu_utilization) return a.gpu_utilization > b.gpu_utilization;
+				return a.mem_used > b.mem_used;
+			});
+			Gpu::proc_available = process_memory_functions_available or process_utilization_function_available;
 			return true;
 		}
     }
@@ -3081,6 +3306,7 @@ namespace Gpu {
 		static int gpu_panel_height_offset(const gpu_info& gpu) {
 			return gpu.supported_functions.gpu_utilization
 				+ gpu.supported_functions.pwr_usage
+				+ gpu.supported_functions.utilization_breakdown
 				+ (gpu.supported_functions.encoder_utilization or gpu.supported_functions.decoder_utilization)
 				+ (gpu.supported_functions.mem_total or gpu.supported_functions.mem_used)
 					* (1 + 2*(gpu.supported_functions.mem_total and gpu.supported_functions.mem_used) + 2*gpu.supported_functions.mem_utilization);
@@ -3659,6 +3885,9 @@ namespace Gpu {
 			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), width * 2)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
 			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), width * 2)) shared_gpu_percent.at("gpu-vram-total").pop_front();
 		}
+
+		//? Refresh the per-process breakdown used by the GPU panel in the memory box.
+		Nvml::collect_process_stats();
 
 		count = gpus.size();
 

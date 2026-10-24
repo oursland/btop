@@ -223,6 +223,8 @@ namespace Gpu {
 		CFMutableDictionaryRef ior_chan = nullptr;
 		CFDictionaryRef prev_sample = nullptr;
 		uint64_t prev_sample_time = 0;
+		//? AGXAccelerator service, used for the Renderer/Tiler utilization breakdown.
+		io_service_t agx_service = 0;
 
 		//? GPU frequency table from DVFS
 		vector<uint32_t> gpu_freqs;
@@ -233,6 +235,13 @@ namespace Gpu {
 			if (CFStringGetCString(cfstr, buf, sizeof(buf), kCFStringEncodingUTF8))
 				return string(buf);
 			return "";
+		}
+
+		static bool cf_number_to_ll(CFDictionaryRef dict, CFStringRef key, long long& out) {
+			if (not dict) return false;
+			CFTypeRef value = CFDictionaryGetValue(dict, key);
+			if (not value or CFGetTypeID(value) != CFNumberGetTypeID()) return false;
+			return CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &out);
 		}
 
 		static string get_chip_name() {
@@ -320,6 +329,26 @@ namespace Gpu {
 				return false;
 			}
 
+			//? Find the AGXAccelerator service that publishes Renderer/Tiler utilization.
+			CFMutableDictionaryRef agx_match = IOServiceMatching("IOAccelerator");
+			io_iterator_t agx_iter = 0;
+			if (agx_match and IOServiceGetMatchingServices(kIOMainPortDefault, agx_match, &agx_iter) == kIOReturnSuccess) {
+				io_object_t service = 0;
+				while ((service = IOIteratorNext(agx_iter)) != 0) {
+					CFTypeRef stats = IORegistryEntryCreateCFProperty(service, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
+					if (stats) {
+						const bool is_dict = CFGetTypeID(stats) == CFDictionaryGetTypeID();
+						CFRelease(stats);
+						if (is_dict) {
+							agx_service = service;
+							break;
+						}
+					}
+					IOObjectRelease(service);
+				}
+				IOObjectRelease(agx_iter);
+			}
+
 			device_count = 1; //? Apple Silicon has one integrated GPU
 			gpus.resize(gpus.size() + device_count);
 			gpu_names.resize(gpu_names.size() + device_count);
@@ -338,6 +367,7 @@ namespace Gpu {
 
 		bool shutdown() {
 			if (not initialized) return false;
+			if (agx_service) { IOObjectRelease(agx_service); agx_service = 0; }
 			if (prev_sample) { CFRelease(prev_sample); prev_sample = nullptr; }
 			if (ior_chan) { CFRelease(ior_chan); ior_chan = nullptr; }
 			if (ior_sub) { CFRelease((CFTypeRef)ior_sub); ior_sub = nullptr; }
@@ -496,7 +526,9 @@ namespace Gpu {
 					.pcie_txrx = false,
 					.pcie_link = false,
 					.encoder_utilization = false,
-					.decoder_utilization = false
+					.decoder_utilization = false,
+					.utilization_breakdown = (agx_service != 0),
+					.ane_info = true
 				};
 
 				//? M3 and later expose no GPU named IOHID thermal sensor, so fall back to
@@ -540,6 +572,15 @@ namespace Gpu {
 			bool got_gpu_util = false;
 			double gpu_power_watts = 0;
 			bool got_gpu_power = false;
+			long long ane_power_mw = 0;
+			bool got_ane = false;
+
+			auto energy_to_watts = [](double energy, const string& unit) {
+				if (unit.find("nJ") != string::npos) return energy / 1e9;
+				if (unit.find("uJ") != string::npos or unit.find("\xc2\xb5J") != string::npos) return energy / 1e6;
+				if (unit.find("mJ") != string::npos) return energy / 1e3;
+				return energy; //? assume joules
+			};
 			const bool normalize_gpu_utilization = Config::getS("gpu_utilization_mode") == "normalized";
 
 			long chan_count = CFArrayGetCount(channels);
@@ -601,22 +642,40 @@ namespace Gpu {
 
 				//? GPU power from Energy Model
 				if (group == "Energy Model" and channel == "GPU Energy") {
-					string unit = cfstring_to_string(IOReportChannelGetUnitLabel(item));
-					int64_t val = IOReportSimpleGetIntegerValue(item, 0);
-					double energy = static_cast<double>(val);
-					double divisor = static_cast<double>(dt) / 1000.0; // dt is in ms
-
-					if (unit.find("nJ") != string::npos) energy /= 1e9;
-					else if (unit.find("uJ") != string::npos or unit.find("\xc2\xb5J") != string::npos) energy /= 1e6;
-					else if (unit.find("mJ") != string::npos) energy /= 1e3;
-					//? energy is now in Joules
-
-					if (divisor > 0) {
-						gpu_power_watts = energy / divisor;
+					const int64_t val = IOReportSimpleGetIntegerValue(item, 0);
+					const double divisor = static_cast<double>(dt) / 1000.0; // dt is in ms
+					if (divisor > 0.0) {
+						gpu_power_watts = energy_to_watts(static_cast<double>(val), cfstring_to_string(IOReportChannelGetUnitLabel(item))) / divisor;
 						got_gpu_power = true;
 					}
 				}
+				//? The ANE is only exposed as energy (mJ), not as an activity percentage.
+				if (group == "Energy Model" and channel == "ANE0") {
+					const int64_t val = IOReportSimpleGetIntegerValue(item, 0);
+					const double divisor = static_cast<double>(dt) / 1000.0;
+					if (divisor > 0.0) {
+						ane_power_mw = static_cast<long long>(llround(energy_to_watts(static_cast<double>(val), cfstring_to_string(IOReportChannelGetUnitLabel(item))) / divisor * 1000.0));
+						got_ane = true;
+					}
+				}
 			}
+
+			//? Renderer/Tiler breakdown from AGXAccelerator.PerformanceStatistics.
+			if (agx_service) {
+				CFTypeRef stats = IORegistryEntryCreateCFProperty(agx_service, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
+				if (stats) {
+					if (CFGetTypeID(stats) == CFDictionaryGetTypeID()) {
+						long long value = 0;
+						if (cf_number_to_ll((CFDictionaryRef)stats, CFSTR("Renderer Utilization %"), value))
+							gpus_slice[0].renderer_utilization = clamp(value, 0ll, 100ll);
+						if (cf_number_to_ll((CFDictionaryRef)stats, CFSTR("Tiler Utilization %"), value))
+							gpus_slice[0].tiler_utilization = clamp(value, 0ll, 100ll);
+					}
+					CFRelease(stats);
+				}
+			}
+			if (got_ane)
+				gpus_slice[0].ane_power_mw = ane_power_mw;
 
 			//? Store GPU utilization
 			if (got_gpu_util) {
@@ -925,7 +984,9 @@ namespace Gpu {
 					.pcie_txrx = false,
 					.pcie_link = false,
 					.encoder_utilization = false,
-					.decoder_utilization = false
+					.decoder_utilization = false,
+					.utilization_breakdown = false,
+					.ane_info = false
 				};
 
 				if (supports_power) {
@@ -1140,6 +1201,7 @@ namespace Shared {
 			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
 				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
 					+ gpus[i].supported_functions.pwr_usage
+					+ gpus[i].supported_functions.utilization_breakdown
 					+ (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
 					+ (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
 						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);

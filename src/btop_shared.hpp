@@ -147,7 +147,9 @@ namespace Gpu {
 				 pcie_link = true,
 				 encoder_utilization = true,
 				 decoder_utilization = true,
-				 gt_utilization = false;
+				 gt_utilization = false,
+				 utilization_breakdown = false,
+				 ane_info = false;
 	};
 
 	//* Per-device container for GPU info
@@ -184,11 +186,39 @@ namespace Gpu {
 		long long encoder_utilization = 0;
 		long long decoder_utilization = 0;
 
+		//? Apple Silicon sub-utilization breakdown (Renderer/Tiler) and ANE power.
+		long long renderer_utilization = 0; // percent
+		long long tiler_utilization = 0;    // percent
+		long long ane_power_mw = 0;         // milliwatts
+
 		gpu_info_supported supported_functions;
 
 		// vector<proc_info> graphics_processes = {}; // TODO
 		// vector<proc_info> compute_processes = {};
 	};
+
+	//* Per-device GPU data, populated by the platform collector
+	extern vector<gpu_info> gpus;
+
+	//* Per-process GPU statistics (currently NVIDIA/NVML on Linux)
+	struct gpu_proc_info {
+		unsigned int gpu_index = 0;
+		unsigned int pid = 0;
+		string name;
+		string user;
+		unsigned int gpu_utilization = 0; // percent
+		unsigned long long mem_used = 0;  // bytes
+	};
+	struct gpu_proc_device {
+		string name;
+		string pci_bus_id;
+		long long mem_total = 0;
+		long long mem_used = 0;
+		unsigned int utilization = 0; // percent
+	};
+	extern vector<gpu_proc_info> proc_info;
+	extern vector<gpu_proc_device> proc_devices;
+	extern bool proc_available;
 
 	namespace Nvml {
 		extern bool shutdown();

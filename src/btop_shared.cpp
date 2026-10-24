@@ -90,6 +90,10 @@ namespace Gpu {
 		{"gpu-pwr-total", {}},
 	};
 	long long gpu_pwr_total_max = 0;
+
+	vector<gpu_proc_info> proc_info;
+	vector<gpu_proc_device> proc_devices;
+	bool proc_available = false;
 }
 #endif
 

@@ -489,6 +489,17 @@ namespace Menu {
 					"\"Auto\" to show when no gpu box is shown.",
 					"\"On\" to always show.",
 					"\"Off\" to never show."},
+		#if defined(__linux__)
+			{"show_gpu_proc",
+					"Show per-process GPU statistics.",
+					"",
+					"Adds a GPU process panel under the disks",
+					"panel (NVIDIA/NVML only).",
+					"",
+					"\"Auto\" to show when available.",
+					"\"On\" to always show.",
+					"\"Off\" to never show."},
+		#endif
 		#endif
 			{"check_temp",
 				"Enable cpu temperature reporting.",
@@ -1341,6 +1352,9 @@ static int optionsMenu(const string& key) {
 			{"disable_presets", std::cref(Config::disable_preset_options)},
 		#ifdef GPU_SUPPORT
 			{"show_gpu_info", std::cref(Config::show_gpu_values)},
+		#if defined(__linux__)
+			{"show_gpu_proc", std::cref(Config::show_gpu_values)},
+		#endif
 			{"graph_symbol_gpu", std::cref(Config::valid_graph_symbols_def)},
 			#ifdef __APPLE__
 			{"gpu_utilization_mode", std::cref(Config::gpu_utilization_modes)},
@@ -1584,7 +1598,7 @@ static int optionsMenu(const string& key) {
 					else if (option == "base_10_bitrate") {
 						recollect = true;
 					}
-					else if (is_in(option, "proc_sorting", "cpu_sensor", "show_gpu_info") or option.starts_with("graph_symbol") or option.starts_with("cpu_graph_"))
+					else if (is_in(option, "proc_sorting", "cpu_sensor", "show_gpu_info", "show_gpu_proc") or option.starts_with("graph_symbol") or option.starts_with("cpu_graph_"))
 						screen_redraw = true;
 					else if (option == "disable_presets" and optList.at(i) != "Off") {
 						atomic_wait(Runner::active);
